@@ -86,26 +86,52 @@ export interface WriteManagedSkillInput {
 	name: string;
 	description: string;
 	body: string;
+	agentDir?: string;
+}
+
+export interface ManagedSkillArtifactIdentity {
+	name: string;
+	path: string;
+	contentSha256: string;
+	size: number;
+	dev: number | null;
+	ino: number | null;
+}
+
+export interface CreatePersonalizationManagedSkillInput {
+	projectPrefix: string;
+	candidateId: number;
+	suffix: string;
+	description: string;
+	body: string;
+	agentDir?: string;
+}
+
+export interface DeleteManagedSkillIfExactInput extends ManagedSkillArtifactIdentity {
+	agentDir?: string;
 }
 
 /**
- * Serialize create/update/delete on the same skill name. Both tools are
- * non-exclusive, so a parallel tool batch in one turn can run two mutations on
- * the same skill at once (e.g. an update observing the file mid-delete). This
- * per-name promise chain runs same-skill mutations in submission order while
- * different names still proceed in parallel. In-process only; cross-process
- * races are out of scope.
+ * Serialize mutations on the same skill path. Both tools are non-exclusive,
+ * so a parallel tool batch in one turn can otherwise observe a file mid-delete.
+ * This per-path promise chain runs same-skill mutations in submission order
+ * while different managed roots and names still proceed in parallel.
+ * In-process only; cross-process races are out of scope.
  */
 const skillMutationChains = new Map<string, Promise<unknown>>();
-function serializeSkillMutation<T>(name: string, op: () => Promise<T>): Promise<T> {
-	const prev = skillMutationChains.get(name) ?? Promise.resolve();
+function serializeSkillMutation<T>(key: string, op: () => Promise<T>): Promise<T> {
+	const prev = skillMutationChains.get(key) ?? Promise.resolve();
 	const run = prev.then(op, op);
 	const guarded = run.catch(() => {});
-	skillMutationChains.set(name, guarded);
+	skillMutationChains.set(key, guarded);
 	void guarded.finally(() => {
-		if (skillMutationChains.get(name) === guarded) skillMutationChains.delete(name);
+		if (skillMutationChains.get(key) === guarded) skillMutationChains.delete(key);
 	});
 	return run;
+}
+
+function getSkillMutationKey(managedRoot: string, name: string): string {
+	return `${path.resolve(managedRoot)}\0${name}`;
 }
 
 /**
@@ -114,13 +140,16 @@ function serializeSkillMutation<T>(name: string, op: () => Promise<T>): Promise<
  * valid name write/delete outside the isolated directory (e.g. onto authored
  * skills). Checked before composing any child path.
  */
-async function assertManagedRootSafe(): Promise<void> {
-	const rootStat = await fs.lstat(getManagedSkillsDir()).catch(err => {
+async function assertManagedRootSafe(agentDir?: string): Promise<void> {
+	const rootStat = await fs.lstat(getManagedSkillsDir(agentDir)).catch(err => {
 		if (isEnoent(err)) return null;
 		throw err;
 	});
 	if (rootStat?.isSymbolicLink()) {
 		throw new Error("The managed-skills root is a symlink; refusing to operate outside the managed directory.");
+	}
+	if (rootStat !== null && !rootStat.isDirectory()) {
+		throw new Error("The managed-skills root is not a directory; refusing to operate.");
 	}
 }
 
@@ -171,9 +200,10 @@ export async function writeManagedSkill(input: WriteManagedSkillInput): Promise<
 			`Managed skill is ${bytes} bytes; the limit is ${MAX_MANAGED_SKILL_BYTES}. Trim the body or description.`,
 		);
 	}
-	return serializeSkillMutation(name, async () => {
-		await assertManagedRootSafe();
-		const dir = path.join(getManagedSkillsDir(), name);
+	const managedRoot = getManagedSkillsDir(input.agentDir);
+	return serializeSkillMutation(getSkillMutationKey(managedRoot, name), async () => {
+		await assertManagedRootSafe(input.agentDir);
+		const dir = path.join(managedRoot, name);
 		const file = path.join(dir, "SKILL.md");
 		// Reject a symlinked skill directory: an intermediate symlink would let the
 		// write escape the isolated managed root. lstat does not follow the final
@@ -232,9 +262,10 @@ export async function writeManagedSkill(input: WriteManagedSkillInput): Promise<
 /** Delete a managed skill directory. Throws when it does not exist. */
 export async function deleteManagedSkill(name: string): Promise<void> {
 	const safe = sanitizeSkillName(name);
-	await serializeSkillMutation(safe, async () => {
+	const managedRoot = getManagedSkillsDir();
+	await serializeSkillMutation(getSkillMutationKey(managedRoot, safe), async () => {
 		await assertManagedRootSafe();
-		const dir = path.join(getManagedSkillsDir(), safe);
+		const dir = path.join(managedRoot, safe);
 		// Refuse to follow a symlinked skill directory (rm would delete the target).
 		const dirStat = await fs.lstat(dir).catch(err => {
 			if (isEnoent(err)) return null;
@@ -251,5 +282,238 @@ export async function deleteManagedSkill(name: string): Promise<void> {
 			}
 			throw err;
 		}
+	});
+}
+
+const PERSONALIZATION_MANAGED_SKILL_PREFIX = "personalization";
+const READ_FILE_OPEN_FLAGS = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
+
+function sanitizePersonalizationNamePart(raw: string, label: string): string {
+	const sanitized = raw
+		.trim()
+		.toLowerCase()
+		.normalize("NFKD")
+		.replace(/\p{M}/gu, "")
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "");
+	if (!sanitized) {
+		throw new Error(`Personalization managed skill ${label} must contain a letter or digit.`);
+	}
+	return sanitized;
+}
+
+function truncateNamePart(value: string, maxLength: number): string {
+	const truncated = value.slice(0, maxLength).replace(/-+$/g, "");
+	return truncated || value.slice(0, 1);
+}
+
+/** Build the reserved, candidate-specific name used for a personalization-managed skill. */
+export function getPersonalizationManagedSkillName(
+	projectPrefix: string,
+	candidateId: number,
+	suffix: string,
+): string {
+	if (!Number.isSafeInteger(candidateId) || candidateId <= 0) {
+		throw new Error("Personalization candidate ID must be a positive safe integer.");
+	}
+	const project = sanitizePersonalizationNamePart(projectPrefix, "project prefix");
+	const proposalSuffix = sanitizePersonalizationNamePart(suffix, "suffix");
+	const id = String(candidateId);
+	// Keep both human-readable fragments while preserving the fixed prefix and
+	// full candidate ID. The final value always fits sanitizeSkillName's 64-char cap.
+	const availableForParts = 64 - PERSONALIZATION_MANAGED_SKILL_PREFIX.length - id.length - 3;
+	const boundedSuffix = truncateNamePart(proposalSuffix, Math.min(24, availableForParts - 1));
+	const boundedProject = truncateNamePart(project, availableForParts - boundedSuffix.length);
+	return sanitizeSkillName(
+		`${PERSONALIZATION_MANAGED_SKILL_PREFIX}-${boundedProject}-${id}-${boundedSuffix}`,
+	);
+}
+
+function assertManagedSkillFileSafeForExactDelete(name: string, fileStat: Stats): void {
+	if (fileStat.isSymbolicLink()) {
+		throw new Error(`Managed skill "${name}" SKILL.md is a symlink; refusing exact deletion.`);
+	}
+	if (!fileStat.isFile()) {
+		throw new Error(`Managed skill "${name}" SKILL.md is not a regular file; refusing exact deletion.`);
+	}
+	if (fileStat.nlink !== 1) {
+		throw new Error(
+			`Managed skill "${name}" SKILL.md has ${fileStat.nlink} hard links; refusing exact deletion.`,
+		);
+	}
+}
+
+function sameFileIdentity(left: Stats, right: Stats): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
+}
+
+function serializableStatIdentity(value: number): number | null {
+	return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+async function readExactManagedSkill(name: string, file: string): Promise<{ bytes: Uint8Array; stat: Stats }> {
+	const pathStat = await fs.lstat(file).catch(err => {
+		if (isEnoent(err)) return null;
+		throw err;
+	});
+	if (pathStat === null) {
+		throw new Error(`Managed skill "${name}" does not exist.`);
+	}
+	assertManagedSkillFileSafeForExactDelete(name, pathStat);
+
+	let handle;
+	try {
+		handle = await fs.open(file, READ_FILE_OPEN_FLAGS);
+	} catch (err) {
+		if ((err as { code?: string }).code === "ELOOP") {
+			throw new Error(`Managed skill "${name}" SKILL.md is a symlink; refusing exact deletion.`);
+		}
+		throw err;
+	}
+	try {
+		const openStat = await handle.stat();
+		assertManagedSkillFileSafeForExactDelete(name, openStat);
+		if (!sameFileIdentity(pathStat, openStat)) {
+			throw new Error(`Managed skill "${name}" changed identity while it was being inspected; refusing exact deletion.`);
+		}
+		const bytes = new Uint8Array(await handle.readFile());
+		if (bytes.byteLength !== openStat.size) {
+			throw new Error(`Managed skill "${name}" changed size while it was being inspected; refusing exact deletion.`);
+		}
+		return { bytes, stat: openStat };
+	} finally {
+		await handle.close();
+	}
+}
+
+/**
+ * Create a personalization-managed skill without any update path and return
+ * enough identity to prove that a later rollback targets the same file.
+ */
+export async function createPersonalizationManagedSkill(
+	input: CreatePersonalizationManagedSkillInput,
+): Promise<ManagedSkillArtifactIdentity> {
+	const name = getPersonalizationManagedSkillName(input.projectPrefix, input.candidateId, input.suffix);
+	const managedRoot = getManagedSkillsDir(input.agentDir);
+	const written = await writeManagedSkill({
+		action: "create",
+		name,
+		description: input.description,
+		body: input.body,
+		agentDir: input.agentDir,
+	});
+	await assertManagedRootSafe(input.agentDir);
+	const canonicalRoot = await fs.realpath(managedRoot);
+	const canonicalPath = await fs.realpath(written.path);
+	const expectedPath = path.join(canonicalRoot, name, "SKILL.md");
+	if (canonicalPath !== expectedPath) {
+		throw new Error(`Personalization managed skill "${name}" escaped the canonical managed root.`);
+	}
+	const { bytes, stat } = await readExactManagedSkill(name, written.path);
+	return {
+		name,
+		path: canonicalPath,
+		contentSha256: Bun.SHA256.hash(bytes, "hex"),
+		size: bytes.byteLength,
+		dev: serializableStatIdentity(stat.dev),
+		ino: serializableStatIdentity(stat.ino),
+	};
+}
+
+function assertExpectedArtifactIdentity(expected: ManagedSkillArtifactIdentity): void {
+	if (!/^[a-f0-9]{64}$/.test(expected.contentSha256)) {
+		throw new Error("Expected managed-skill content SHA-256 must be 64 lowercase hexadecimal characters.");
+	}
+	if (!Number.isSafeInteger(expected.size) || expected.size < 0) {
+		throw new Error("Expected managed-skill size must be a non-negative safe integer.");
+	}
+	for (const [label, value] of [
+		["device", expected.dev],
+		["inode", expected.ino],
+	] as const) {
+		if (value !== null && (!Number.isSafeInteger(value) || value < 0)) {
+			throw new Error(`Expected managed-skill ${label} must be null or a non-negative safe integer.`);
+		}
+	}
+}
+
+/**
+ * Delete a personalization-managed skill only when every persisted identity
+ * field still describes the exact canonical regular file created earlier.
+ */
+export async function deleteManagedSkillIfExact(expected: DeleteManagedSkillIfExactInput): Promise<void> {
+	const safe = sanitizeSkillName(expected.name);
+	if (safe !== expected.name) {
+		throw new Error("Expected managed-skill name must already be in canonical sanitized form.");
+	}
+	assertExpectedArtifactIdentity(expected);
+	const managedRoot = getManagedSkillsDir(expected.agentDir);
+	await serializeSkillMutation(getSkillMutationKey(managedRoot, safe), async () => {
+		await assertManagedRootSafe(expected.agentDir);
+		const canonicalRoot = await fs.realpath(managedRoot).catch(err => {
+			if (isEnoent(err)) throw new Error(`Managed skill "${safe}" does not exist.`);
+			throw err;
+		});
+		const expectedCanonicalPath = path.join(canonicalRoot, safe, "SKILL.md");
+		if (expected.path !== expectedCanonicalPath) {
+			throw new Error(`Managed skill "${safe}" canonical path does not match the persisted exact path.`);
+		}
+
+		const dir = path.join(managedRoot, safe);
+		const dirStat = await fs.lstat(dir).catch(err => {
+			if (isEnoent(err)) return null;
+			throw err;
+		});
+		if (dirStat === null) {
+			throw new Error(`Managed skill "${safe}" does not exist.`);
+		}
+		if (dirStat.isSymbolicLink()) {
+			throw new Error(`Managed skill "${safe}" directory is a symlink; refusing exact deletion.`);
+		}
+		if (!dirStat.isDirectory()) {
+			throw new Error(`Managed skill "${safe}" path is not a directory; refusing exact deletion.`);
+		}
+		const canonicalDir = await fs.realpath(dir);
+		if (canonicalDir !== path.dirname(expectedCanonicalPath)) {
+			throw new Error(`Managed skill "${safe}" directory escaped the canonical managed root.`);
+		}
+		const relativeDir = path.relative(canonicalRoot, canonicalDir);
+		if (!relativeDir || relativeDir.startsWith(`..${path.sep}`) || path.isAbsolute(relativeDir)) {
+			throw new Error(`Managed skill "${safe}" directory is not contained by the canonical managed root.`);
+		}
+
+		const entries = await fs.readdir(dir);
+		if (entries.length !== 1 || entries[0] !== "SKILL.md") {
+			throw new Error(`Managed skill "${safe}" directory contains unexpected entries; refusing exact deletion.`);
+		}
+		const file = path.join(dir, "SKILL.md");
+		const snapshot = await readExactManagedSkill(safe, file);
+		const canonicalFile = await fs.realpath(file).catch(err => {
+			if (isEnoent(err)) throw new Error(`Managed skill "${safe}" does not exist.`);
+			throw err;
+		});
+		if (canonicalFile !== expectedCanonicalPath) {
+			throw new Error(`Managed skill "${safe}" canonical file path does not match the persisted exact path.`);
+		}
+
+		const { bytes, stat } = snapshot;
+		if (stat.size !== expected.size || bytes.byteLength !== expected.size) {
+			throw new Error(`Managed skill "${safe}" size changed; refusing exact deletion.`);
+		}
+		const contentSha256 = Bun.SHA256.hash(bytes, "hex");
+		if (contentSha256 !== expected.contentSha256) {
+			throw new Error(`Managed skill "${safe}" content hash changed; refusing exact deletion.`);
+		}
+		if ((expected.dev !== null && stat.dev !== expected.dev) || (expected.ino !== null && stat.ino !== expected.ino)) {
+			throw new Error(`Managed skill "${safe}" filesystem identity changed; refusing exact deletion.`);
+		}
+
+		const finalStat = await fs.lstat(file);
+		assertManagedSkillFileSafeForExactDelete(safe, finalStat);
+		if (!sameFileIdentity(stat, finalStat)) {
+			throw new Error(`Managed skill "${safe}" changed identity before deletion; refusing exact deletion.`);
+		}
+		await fs.unlink(file);
+		await fs.rmdir(dir);
 	});
 }
