@@ -40,6 +40,8 @@ import {
 import { AsyncJobManager } from "./async";
 import { AutoLearnController, buildAutoLearnInstructions } from "./autolearn/controller";
 import { createAutoresearchExtension } from "./autoresearch";
+import { PersonalizationController } from "./personalization/controller";
+import { createPersonalizationExtension } from "./personalization/extension";
 import { loadCapability } from "./capability";
 import { type Rule, ruleCapability, setActiveRules } from "./capability/rule";
 import { bucketRules } from "./capability/rule-buckets";
@@ -1114,10 +1116,16 @@ function buildMCPPromptCommands(manager: MCPManager): LoadedCustomCommand[] {
 	return commands;
 }
 
+const AUTOLEARN_CAPTURE_TOOL_NAMES: Readonly<Record<string, true>> = {
+	manage_skill: true,
+	learn: true,
+	propose_personalization: true,
+};
+
 /** Dependencies used to construct an isolated auto-learn capture agent. */
 export interface AutoLearnCaptureRunnerOptions {
 	sourceAgent: Agent;
-	captureTools: AgentTool[];
+	captureTools: AgentTool[] | (() => AgentTool[]);
 	createAgent: (options: AgentOptions) => Agent;
 	onPayload?: SimpleStreamOptions["onPayload"];
 	onResponse?: SimpleStreamOptions["onResponse"];
@@ -1129,7 +1137,8 @@ export function createAutoLearnCaptureRunner(
 	options: AutoLearnCaptureRunnerOptions,
 ): (content: string, signal?: AbortSignal) => Promise<void> {
 	return async (content, signal) => {
-		if (options.captureTools.length === 0 || signal?.aborted) return;
+		const captureTools = typeof options.captureTools === "function" ? options.captureTools() : options.captureTools;
+		if (captureTools.length === 0 || signal?.aborted) return;
 		const captureModel = options.sourceAgent.state.model;
 		if (!captureModel) return;
 
@@ -1150,7 +1159,7 @@ export function createAutoLearnCaptureRunner(
 				model: captureModel,
 				thinkingLevel: options.sourceAgent.state.thinkingLevel,
 				disableReasoning: options.sourceAgent.state.disableReasoning,
-				tools: options.captureTools,
+				tools: captureTools,
 				messages: captureMessages,
 			},
 			sessionId: captureSessionId,
@@ -1927,6 +1936,22 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const builtInToolNames = [...toolRegistry.keys()];
 		let customToolPaths: ToolPathWithSource[] = [];
 		const inlineExtensions: ExtensionFactory[] = [];
+		const personalizationController =
+			!restrictToolNames && taskDepth === 0
+				? new PersonalizationController({
+						settings,
+						cwd,
+						agentDir,
+						getSessionId: () => sessionManager.getSessionId(),
+						getSessionRef: () => sessionManager.getSessionFile() ?? null,
+						getModelSelector: () => {
+							const currentModel = session?.model;
+							return currentModel ? formatModelString(currentModel) : null;
+						},
+						isPlanMode: () => session?.getPlanModeState()?.enabled === true,
+						isGoalMode: () => session?.getGoalModeState()?.enabled === true,
+					})
+				: undefined;
 		if (!restrictToolNames) {
 			// Add image tools when generation is enabled and either no explicit tool
 			// whitelist was given or it names `generate_image`. Unlike built-in tools
@@ -1972,6 +1997,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 			inlineExtensions.push(...(options.extensions ?? []));
 			inlineExtensions.push(createAutoresearchExtension);
+			if (personalizationController) {
+				inlineExtensions.push(createPersonalizationExtension({ controller: personalizationController, settings }));
+			}
 			if (customTools.length > 0) {
 				inlineExtensions.push(createCustomToolsExtension(customTools));
 			}
@@ -3787,7 +3815,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 		const runAutoLearnCapture = createAutoLearnCaptureRunner({
 			sourceAgent: agent,
-			captureTools: autoLearnCaptureTools,
+			captureTools: () => {
+				const allowed = AUTOLEARN_CAPTURE_TOOL_NAMES;
+				return session
+					.getActiveToolNames()
+					.filter(name => allowed[name] === true)
+					.map(name => toolRegistry.get(name))
+					.filter((tool): tool is AgentTool => tool !== undefined);
+			},
 			onPayload,
 			onResponse,
 			createAgent: captureOptions => {
@@ -3841,29 +3876,32 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		});
 
 		// Auto-learn can immediately trigger a private capture after the first real
-		// stop. When a memory backend is selected, install that backend's
-		// per-session state first so the capture turn's `learn` tool observes the
-		// same initialized state as normal memory tools. Other sessions keep memory
-		// startup in the background to preserve the existing startup profile.
-		//
-		// Gated on `autolearn.enabled` to match the tools: `createTools` builds the
-		// `learn`/`manage_skill` registry ONCE at session start and no settings
-		// change rebuilds it, so installing the controller while disabled would let a
-		// mid-session enable fire a nudge pointing at tools the session never built.
-		// Activation is therefore a session-start decision for BOTH the controller
-		// and the tools; the fire-time re-check in `#onAgentEnd` still handles a
-		// mid-session DISABLE. The subscription lives for the session's lifetime; the
-		// reference is intentionally discarded (the listener retains it).
+		// stop, so initialize its selected memory backend first. Personalization-only
+		// sessions keep memory startup in the background. Both purposes share one
+		// capture controller, and its tools are resolved at capture time so
+		// /personalize on|off takes effect immediately.
 		if (!restrictToolNames) {
-			if (settings.get("autolearn.enabled") && taskDepth === 0) {
+			const autoLearnEnabled = settings.get("autolearn.enabled") === true;
+			const personalizationReflectionAvailable = settings.get("personalization.autoReflect") === true;
+			if (autoLearnEnabled && taskDepth === 0) {
 				await logger.time("startMemoryStartupTask", startMemoryBackend);
-				new AutoLearnController({
-					session,
-					settings,
-					capture: content => session.runAutolearnCapture(signal => runAutoLearnCapture(content, signal)),
-				});
 			} else {
 				void logger.time("startMemoryStartupTask", startMemoryBackend);
+			}
+			if (taskDepth === 0) {
+				// Personalization must observe the terminal turn before AutoLearn
+				// reads its just-recorded reflection signal.
+				if (personalizationController) {
+					session.subscribe(event => personalizationController.handleEvent(event));
+				}
+				if (autoLearnEnabled || personalizationReflectionAvailable) {
+					new AutoLearnController({
+						session,
+						settings,
+						capture: content => session.runAutolearnCapture(signal => runAutoLearnCapture(content, signal)),
+						getPersonalizationTrajectory: () => personalizationController?.getJustRecordedTrajectory() ?? null,
+					});
+				}
 			}
 		}
 
