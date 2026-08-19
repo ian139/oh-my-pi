@@ -1,10 +1,10 @@
 /**
- * Auto-learn session controller (experimental).
+ * Auto-learn and personalization reflection session controller (experimental).
  *
- * Subscribes to the session event stream and, after a substantive turn,
- * optionally auto-runs a synthetic capture turn. Passive mode is intentionally
- * prompt-cache neutral: the standing system guidance remains available, but no
- * hidden mid-session reminder is inserted into the conversation.
+ * Subscribes to the session event stream and, after an eligible terminal turn,
+ * optionally auto-runs one synthetic capture turn. Auto-Learn passive mode is
+ * intentionally prompt-cache neutral: the standing system guidance remains
+ * available, but no hidden mid-session reminder is inserted into the conversation.
  *
  * Installed once per top-level session (taskDepth 0). The subscription lives
  * for the session's lifetime — `newSession` resets the session in place
@@ -12,12 +12,16 @@
  */
 import { logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
+import autolearnNudgeCombined from "../prompts/autolearn-nudge-combined.md" with { type: "text" };
+import autolearnNudgePersonalization from "../prompts/autolearn-nudge-personalization.md" with { type: "text" };
 import autolearnGuidance from "../prompts/system/autolearn-guidance.md" with { type: "text" };
 import autolearnGuidanceLearn from "../prompts/system/autolearn-guidance-learn.md" with { type: "text" };
 import autolearnNudgeAutoContinue from "../prompts/system/autolearn-nudge-autocontinue.md" with { type: "text" };
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 
 const AUTOLEARN_NUDGE_AUTOCONTINUE = autolearnNudgeAutoContinue.trim();
+const AUTOLEARN_NUDGE_PERSONALIZATION = autolearnNudgePersonalization.trim();
+const AUTOLEARN_NUDGE_COMBINED = autolearnNudgeCombined.trim();
 const DEFAULT_MIN_TOOL_CALLS = 5;
 
 /**
@@ -38,16 +42,37 @@ export function buildAutoLearnInstructions(available: { manageSkill: boolean; le
 	return parts.join("\n\n");
 }
 
+export interface PersonalizationTrajectorySignal {
+	substantive: boolean;
+	negative: boolean;
+}
+
 export interface AutoLearnControllerOptions {
 	session: AgentSession;
 	settings: Settings;
 	capture: (content: string) => Promise<void>;
+	/**
+	 * Returns the trajectory recorded for the current terminal turn. The
+	 * personalization subscriber must be installed before this controller.
+	 */
+	getPersonalizationTrajectory?: () => PersonalizationTrajectorySignal | null;
+}
+
+interface CapturePurposes {
+	autoLearn: boolean;
+	personalization: boolean;
+}
+
+function capturePrompt(purposes: CapturePurposes): string {
+	if (purposes.autoLearn && purposes.personalization) return AUTOLEARN_NUDGE_COMBINED;
+	return purposes.personalization ? AUTOLEARN_NUDGE_PERSONALIZATION : AUTOLEARN_NUDGE_AUTOCONTINUE;
 }
 
 export class AutoLearnController {
 	readonly #session: AgentSession;
 	readonly #settings: Settings;
 	readonly #capture: (content: string) => Promise<void>;
+	readonly #getPersonalizationTrajectory: (() => PersonalizationTrajectorySignal | null) | undefined;
 	#toolCalls = 0;
 	/**
 	 * Whether the in-flight turn BEGAN while goal mode was active. Captured at
@@ -56,15 +81,18 @@ export class AutoLearnController {
 	 * would let a goal-continuation turn slip through and get nudged.
 	 */
 	#turnStartedInGoalMode = false;
+	/** Preserve plan-mode eligibility across non-terminal continuations. */
+	#turnStartedInPlanMode = false;
 	/** Prevent overlapping private capture runs while real primary turns continue. */
 	#captureInFlight = false;
-	/** One newer eligible primary stop arrived while capture was running. */
-	#capturePending = false;
+	/** Purposes coalesced from eligible primary stops while capture is running. */
+	#capturePending: CapturePurposes | null = null;
 
 	constructor(options: AutoLearnControllerOptions) {
 		this.#session = options.session;
 		this.#settings = options.settings;
 		this.#capture = options.capture;
+		this.#getPersonalizationTrajectory = options.getPersonalizationTrajectory;
 		// The listener closure captures `this`, so the session's listener array
 		// keeps the controller alive — no stored unsubscribe needed.
 		this.#session.subscribe(event => this.#onEvent(event));
@@ -72,8 +100,10 @@ export class AutoLearnController {
 
 	#onEvent(event: AgentSessionEvent): void {
 		if (event.type === "agent_start") {
-			// Capture goal-mode state at the turn boundary, before any tool runs.
-			this.#turnStartedInGoalMode = this.#session.getGoalModeState()?.enabled === true;
+			// A non-terminal continuation can emit another start. Preserve whether
+			// any segment of the still-running primary turn began in a guarded mode.
+			this.#turnStartedInGoalMode ||= this.#session.getGoalModeState()?.enabled === true;
+			this.#turnStartedInPlanMode ||= this.#session.getPlanModeState()?.enabled === true;
 			return;
 		}
 		if (event.type === "tool_execution_end") {
@@ -86,19 +116,20 @@ export class AutoLearnController {
 	}
 
 	#onAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
-		// Snapshot and reset every turn: the counter describes only the
-		// just-finished turn, so below-threshold, disabled, and plan-mode stops
-		// must not let tool calls accumulate into a later turn.
+		// A scheduled continuation belongs to the same primary turn. Keep its
+		// counters and evaluate only the final settle.
+		if (event.isTerminal === false) return;
+
+		// Snapshot and reset exactly once per terminal turn. Ineligible and
+		// disabled turns must not let state accumulate into a later turn.
 		const toolCalls = this.#toolCalls;
 		this.#toolCalls = 0;
-		// Snapshot the turn-start goal flag alongside the counter so a turn that
-		// observed no agent_start can never inherit a stale value.
 		const startedInGoalMode = this.#turnStartedInGoalMode;
 		this.#turnStartedInGoalMode = false;
+		const startedInPlanMode = this.#turnStartedInPlanMode;
+		this.#turnStartedInPlanMode = false;
 
-		// Never nudge a turn that ended in an abort (ESC, cancel, etc.). The
-		// abort flag on the session is unreliable by the time agent_end is
-		// deferred to subscribers; read stopReason from the event messages.
+		// Never reflect on a turn that ended in an abort (ESC, cancel, etc.).
 		for (let i = event.messages.length - 1; i >= 0; i--) {
 			const message = event.messages[i];
 			if (message && typeof message === "object" && "role" in message && message.role === "assistant") {
@@ -108,45 +139,55 @@ export class AutoLearnController {
 				break;
 			}
 		}
-		// Honor a live opt-out: the subscription outlives the setting, so re-check
-		// the current flag rather than trusting install-time state.
-		if (!this.#settings.get("autolearn.enabled")) return;
-		const minToolCalls = this.#settings.get("autolearn.minToolCalls") ?? DEFAULT_MIN_TOOL_CALLS;
-		if (toolCalls < minToolCalls) return;
-		// Never interrupt plan-mode review.
-		if (this.#session.getPlanModeState()?.enabled) return;
-		// Never divert a goal loop. Skip when the turn STARTED in goal mode — a
-		// `goal` tool may have completed/dropped the goal before this stop — or is
-		// still in it: a passive nudge would ride the goal continuation, and
-		// auto-continue would compete with it.
+		// Never interrupt plan-mode review or divert a goal loop.
+		if (startedInPlanMode || this.#session.getPlanModeState()?.enabled) return;
 		if (startedInGoalMode || this.#session.getGoalModeState()?.enabled) return;
 
-		// Auto-run a capture turn only when explicitly enabled. Passive mode used to
-		// queue a hidden custom message for the next real turn, but that mutates the
-		// persisted conversation prefix after providers have cached it. The standing
-		// auto-learn system guidance is stable; keep passive mode to that guidance
-		// so Anthropic prompt-cache prefixes survive long sessions.
-		const autoContinue = this.#settings.get("autolearn.autoContinue") === true;
-		if (!autoContinue) return;
+		const minToolCalls = this.#settings.get("autolearn.minToolCalls") ?? DEFAULT_MIN_TOOL_CALLS;
+		const autoLearn =
+			this.#settings.get("autolearn.enabled") === true &&
+			this.#settings.get("autolearn.autoContinue") === true &&
+			toolCalls >= minToolCalls;
 
-		if (this.#captureInFlight) {
-			this.#capturePending = true;
-			return;
+		let personalization = false;
+		if (
+			this.#settings.get("personalization.enabled") === true &&
+			this.#settings.get("personalization.autoReflect") === true
+		) {
+			const trajectory = this.#getPersonalizationTrajectory?.();
+			personalization = trajectory?.substantive === true || trajectory?.negative === true;
 		}
-		this.#startCapture();
+
+		if (!autoLearn && !personalization) return;
+		this.#queueCapture({ autoLearn, personalization });
 	}
 
-	#startCapture(): void {
+	#queueCapture(purposes: CapturePurposes): void {
+		if (this.#captureInFlight) {
+			const pending = this.#capturePending;
+			this.#capturePending = pending
+				? {
+						autoLearn: pending.autoLearn || purposes.autoLearn,
+						personalization: pending.personalization || purposes.personalization,
+					}
+				: purposes;
+			return;
+		}
+		this.#startCapture(purposes);
+	}
+
+	#startCapture(purposes: CapturePurposes): void {
 		this.#captureInFlight = true;
-		void this.#capture(AUTOLEARN_NUDGE_AUTOCONTINUE)
+		void this.#capture(capturePrompt(purposes))
 			.catch(err => {
-				logger.warn("auto-learn capture failed", { err });
+				logger.warn("auto-learn reflection capture failed", { err });
 			})
 			.finally(() => {
 				this.#captureInFlight = false;
-				if (!this.#capturePending) return;
-				this.#capturePending = false;
-				this.#startCapture();
+				const pending = this.#capturePending;
+				if (!pending) return;
+				this.#capturePending = null;
+				this.#startCapture(pending);
 			});
 	}
 }

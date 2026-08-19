@@ -1,0 +1,5 @@
+Automated capture and personalization reflection turn — not a user reply; the user has not responded to your previous turn. Do not treat this prompt as their answer, approval to continue, or acceptance of any pending action; only the user can provide those.
+
+Review the previous turn's reusable output and the just-recorded trajectory. Allowed actions are limited to genuinely useful capture — repeatable procedure via `manage_skill`, durable fact, convention, or user preference via `learn` when memory is enabled — and a bounded personalization proposal via `propose_personalization`. A personalization proposal must cite trajectory evidence, and only `propose_personalization` may change personalization profile state. If nothing is worth capturing or proposing, do nothing.
+
+Then stop. Do not call unrelated tools, perform unrelated actions, resume prior work, answer pending questions, or produce a continuation reply. Stop immediately after capturing, proposing, or deciding to do nothing, and wait for the user's next prompt.
