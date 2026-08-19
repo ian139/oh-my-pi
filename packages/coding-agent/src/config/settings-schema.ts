@@ -193,7 +193,7 @@ export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 		"Git",
 	],
 	context: ["General", "Compaction", "Rules (TTSR)", "Experimental"],
-	memory: ["General", "Auto-Learn", "Mnemopi", "Hindsight"],
+	memory: ["General", "Auto-Learn", "Personalization", "Mnemopi", "Hindsight"],
 	files: ["Editing", "Reading", "Read Summaries", "LSP"],
 	shell: ["Bash", "Eval & Runtimes"],
 	tools: [
@@ -2764,6 +2764,46 @@ export const SETTINGS_SCHEMA = {
 	},
 	// Config-file-only knob (numbers without `options` are hidden from the UI).
 	"autolearn.minToolCalls": { type: "number", default: 5 },
+
+	// Native trajectory-driven personalization. The master switch is default-off;
+	// numeric evaluation thresholds remain config-file-only.
+	"personalization.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "memory",
+			group: "Personalization",
+			label: "Personalization (experimental)",
+			description: "Learn auditable project guidance from bounded local trajectory signals",
+		},
+	},
+	"personalization.autoReflect": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "memory",
+			group: "Personalization",
+			label: "Reflect after substantive turns",
+			description: "Privately propose profile changes after substantive or negative turns",
+			condition: "personalizationActive",
+		},
+	},
+	"personalization.autoPromoteLowRisk": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "memory",
+			group: "Personalization",
+			label: "Auto-promote low-risk guidance",
+			description: "Evaluate project instructions and tool guidance with deterministic canary trials",
+			condition: "personalizationActive",
+		},
+	},
+	"personalization.minEvidence": { type: "number", default: 2 },
+	"personalization.minEvaluationSamples": { type: "number", default: 3 },
+	"personalization.promotionMargin": { type: "number", default: 0.1 },
+	"personalization.regressionThreshold": { type: "number", default: 0.15 },
+	"personalization.retentionDays": { type: "number", default: 30 },
 
 	// Mnemopi local SQLite memory backend.
 	"mnemopi.dbPath": {

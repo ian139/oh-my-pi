@@ -125,6 +125,13 @@ const CONDITIONS: Record<string, () => boolean> = {
 			return false;
 		}
 	},
+	personalizationActive: () => {
+		try {
+			return Settings.instance.get("personalization.enabled") === true;
+		} catch {
+			return false;
+		}
+	},
 	autoThinkingActive: () => {
 		try {
 			return Settings.instance.get("defaultThinkingLevel") === "auto";
