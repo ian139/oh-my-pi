@@ -138,7 +138,9 @@ function parseRoute(value: unknown): RouteProposal {
 	if (!isRecord(value)) throw new Error("route must be an object.");
 	assertExactKeys(value, ROUTE_KEYS, "route");
 	const model = requiredString(value.model, "route.model", PERSONALIZATION_LIMITS.model);
-	if (!MODEL_SELECTOR_PATTERN.test(model)) throw new Error("route.model is not a valid model selector.");
+	if (model.includes("://") || !MODEL_SELECTOR_PATTERN.test(model)) {
+		throw new Error("route.model is not a valid model selector.");
+	}
 	if (value.thinkingLevel !== undefined && THINKING_LEVELS[value.thinkingLevel as PersonalizationThinkingLevel] !== true) {
 		throw new Error("route.thinkingLevel is invalid.");
 	}
@@ -257,7 +259,7 @@ export function decidePersonalizationEvaluation(
 		const treatment = stats.get("treatment");
 		if (!control || !treatment) return null;
 		if (control.samples < settings.minEvaluationSamples || treatment.samples < settings.minEvaluationSamples) return null;
-		if (treatment.utility - control.utility < settings.promotionMargin) return null;
+		if (treatment.utility - control.utility + Number.EPSILON < settings.promotionMargin) return null;
 		if (treatment.errorRate > control.errorRate) return null;
 		return {
 			candidateId: candidate.id,
@@ -270,7 +272,8 @@ export function decidePersonalizationEvaluation(
 	const active = stats.get("active");
 	if (!active || active.samples < settings.minEvaluationSamples) return null;
 	if (candidate.promotionBaselineUtility === null || candidate.promotionBaselineErrorRate === null) return null;
-	const utilityRegressed = candidate.promotionBaselineUtility - active.utility >= settings.regressionThreshold;
+	const utilityRegressed =
+		candidate.promotionBaselineUtility - active.utility + Number.EPSILON >= settings.regressionThreshold;
 	const errorRateRegressed = active.errorRate > candidate.promotionBaselineErrorRate;
 	if (!utilityRegressed && !errorRateRegressed) return null;
 	return {

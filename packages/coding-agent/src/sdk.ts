@@ -39,9 +39,14 @@ import {
 } from "./advisor";
 import { AsyncJobManager } from "./async";
 import { AutoLearnController, buildAutoLearnInstructions } from "./autolearn/controller";
+import {
+	createPersonalizationManagedSkill,
+	deleteManagedSkillIfExact,
+} from "./autolearn/managed-skills";
 import { createAutoresearchExtension } from "./autoresearch";
 import { PersonalizationController } from "./personalization/controller";
 import { createPersonalizationExtension } from "./personalization/extension";
+import { resolvePersonalizationProject } from "./personalization/store";
 import { loadCapability } from "./capability";
 import { type Rule, ruleCapability, setActiveRules } from "./capability/rule";
 import { bucketRules } from "./capability/rule-buckets";
@@ -1950,6 +1955,31 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						},
 						isPlanMode: () => session?.getPlanModeState()?.enabled === true,
 						isGoalMode: () => session?.getGoalModeState()?.enabled === true,
+						managedSkills: {
+							async create(candidate) {
+								if (!candidate.managedSkill) {
+									throw new Error(`Managed-skill candidate ${candidate.id} has no managed-skill proposal.`);
+								}
+								const project = await resolvePersonalizationProject(cwd);
+								return createPersonalizationManagedSkill({
+									projectPrefix: project.identity.slice(0, 12),
+									candidateId: candidate.id,
+									suffix: candidate.managedSkill.name,
+									description: candidate.managedSkill.description,
+									body: candidate.managedSkill.body,
+									agentDir,
+								});
+							},
+							async delete(candidate) {
+								if (!candidate.managedSkillArtifact) {
+									throw new Error(`Managed-skill candidate ${candidate.id} has no stored artifact identity.`);
+								}
+								await deleteManagedSkillIfExact({ ...candidate.managedSkillArtifact, agentDir });
+							},
+							async deleteCreated(artifact) {
+								await deleteManagedSkillIfExact({ ...artifact, agentDir });
+							},
+						},
 					})
 				: undefined;
 		if (!restrictToolNames) {
@@ -3053,6 +3083,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (toolRegistry.has(name) && !initialToolNames.includes(name)) {
 				initialToolNames.push(name);
 			}
+		}
+		if (
+			!restrictToolNames &&
+			taskDepth === 0 &&
+			settings.get("personalization.enabled") === true &&
+			!initialToolNames.includes("propose_personalization")
+		) {
+			initialToolNames.push("propose_personalization");
 		}
 
 		// Pre-register in the global agent registry BEFORE building the system prompt,

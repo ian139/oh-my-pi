@@ -159,6 +159,7 @@ export function createPersonalizationExtension(options: PersonalizationExtension
 				"Propose one validated, auditable personalization candidate backed by trajectory IDs. This never approves or directly activates high-risk changes.",
 			parameters: proposalSchema,
 			defaultInactive: true,
+			loadMode: "essential",
 			approval: "write",
 			strict: true,
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {

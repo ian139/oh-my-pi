@@ -60,7 +60,7 @@ function stats(...values: ArmStatistics[]): Map<PersonalizationArm, ArmStatistic
 describe("personalization proposal policy", () => {
 	test("accepts only the exact kind-specific proposal shape", () => {
 		const proposal = validatePersonalizationProposal(instructionProposal());
-		expect(proposal).toEqual(instructionProposal());
+		expect(proposal as unknown).toEqual(instructionProposal());
 		expect(() => validatePersonalizationProposal(instructionProposal({ extra: true }))).toThrow("unsupported field");
 		expect(() =>
 			validatePersonalizationProposal(instructionProposal({ trigger: { terms: ["focused-test"], match: "any", regex: ".*" } })),
@@ -101,7 +101,7 @@ describe("personalization proposal policy", () => {
 			trigger: { terms: ["focused-test"], match: "any" },
 			route: { model: "openai/gpt-5.2", thinkingLevel: "high" },
 			evidenceTrajectoryIds: [],
-		};
+		} as const;
 		expect(validatePersonalizationProposal(route).route).toEqual(route.route);
 		expect(() => validatePersonalizationProposal({ ...route, route: { model: "https://example.invalid/model" } })).toThrow(
 			"valid model selector",

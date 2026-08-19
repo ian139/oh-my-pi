@@ -151,7 +151,7 @@ describe("PersonalizationStore", () => {
 		expect(store.prune(30)).toBe(1);
 		store.close();
 		const inspect = new Database(dbPath, { readonly: true });
-		expect(inspect.query<{ count: number }, [number]>("SELECT COUNT(*) count FROM personalization_candidate_sources WHERE candidate_id=?").get(candidate.id)?.count).toBe(1);
+		expect(inspect.query<{ count: number }, [number]>("SELECT COUNT(*) count FROM personalization_candidate_sources WHERE candidate_id=?").get(candidate.id)?.count).toBe(2);
 		expect(inspect.query<{ count: number }, [number]>("SELECT COUNT(*) count FROM personalization_audit WHERE candidate_id=?").get(candidate.id)?.count).toBeGreaterThan(0);
 		inspect.close();
 	});

@@ -8,6 +8,7 @@ import type {
 	CandidateSourceInput,
 	EvaluationDecision,
 	EvaluationSettings,
+	ManagedSkillArtifactIdentity,
 	OutcomeInput,
 	PersonalizationArm,
 	PersonalizationProposal,
@@ -83,19 +84,13 @@ export interface PersonalizationStoreAdapter {
 		to: PersonalizationStatus,
 		reason: string | { actor: "user" | "system"; reason: string },
 	): CandidateRecord;
-	setArtifact?(id: number, name: string, content: string): void;
+	setManagedSkillArtifact?(id: number, artifact: ManagedSkillArtifactIdentity | null): CandidateRecord;
 	recordOutcome(input: OutcomeInput): void;
 	evaluateCandidate(candidateId: number, settings: EvaluationSettings): EvaluationDecision | null;
 	recordAudit?(projectId: number, candidateId: number | null, event: string, details: Record<string, unknown>): void;
 }
 
-export interface PersonalizationManagedArtifact {
-	name: string;
-	path: string;
-	contentSha256: string;
-	dev?: number;
-	ino?: number;
-}
+export type PersonalizationManagedArtifact = ManagedSkillArtifactIdentity;
 
 export interface PersonalizationManagedSkillAdapter {
 	create(candidate: CandidateRecord): Promise<PersonalizationManagedArtifact>;
@@ -398,12 +393,15 @@ export class PersonalizationController {
 			throw new Error(`Candidate ${id} cannot be approved from ${candidate.status}; review an active pending or canary candidate.`);
 		}
 		let artifact: PersonalizationManagedArtifact | null = null;
-		if (candidate.kind === "managed_skill") {
-			if (!this.#managedSkills) throw new Error("Managed-skill personalization is unavailable in this session.");
-			artifact = await this.#managedSkills.create(candidate);
-			store.setArtifact?.(candidate.id, artifact.name, JSON.stringify(artifact));
-		}
 		try {
+			if (candidate.kind === "managed_skill") {
+				if (!this.#managedSkills) throw new Error("Managed-skill personalization is unavailable in this session.");
+				artifact = await this.#managedSkills.create(candidate);
+				if (!store.setManagedSkillArtifact) {
+					throw new Error("Managed-skill artifact persistence is unavailable in this session.");
+				}
+				store.setManagedSkillArtifact(candidate.id, artifact);
+			}
 			return store.transition(candidate.id, "active", { actor: "user", reason: "approved by user" });
 		} catch (error) {
 			if (artifact && this.#managedSkills?.deleteCreated) {

@@ -127,6 +127,14 @@
       "types": "./src/autoresearch/tools/*.ts",
       "import": "./src/autoresearch/tools/*.ts"
     },
+    "./personalization": {
+      "types": "./src/personalization/index.ts",
+      "import": "./src/personalization/index.ts"
+    },
+    "./personalization/*": {
+      "types": "./src/personalization/*.ts",
+      "import": "./src/personalization/*.ts"
+    },
     "./capability": {
       "types": "./src/capability/index.ts",
       "import": "./src/capability/index.ts"

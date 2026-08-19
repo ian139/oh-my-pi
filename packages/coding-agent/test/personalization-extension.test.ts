@@ -32,8 +32,10 @@ function candidate(content: string): CandidateRecord {
 		content,
 		managedSkill: null,
 		route: null,
-		artifactName: null,
-		artifactContent: null,
+		managedSkillArtifact: null,
+		autoPromoted: false,
+		promotionBaselineUtility: null,
+		promotionBaselineErrorRate: null,
 		createdAt: 1,
 		updatedAt: 1,
 	};
