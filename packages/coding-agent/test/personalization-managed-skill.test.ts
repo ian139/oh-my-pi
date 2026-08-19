@@ -72,6 +72,9 @@ describe("personalization managed skills", () => {
 
 		expect(await recoverPersonalizationManagedSkill(input)).toEqual(created);
 		expect(await recoverPersonalizationManagedSkill(input, created)).toEqual(created);
+		await fs.rm(path.dirname(created.path), { recursive: true });
+		await expect(recoverPersonalizationManagedSkill(input, created)).rejects.toThrow();
+		expect(await Bun.file(created.path).exists()).toBe(false);
 	});
 
 	it("deletes only the exact created skill", async () => {

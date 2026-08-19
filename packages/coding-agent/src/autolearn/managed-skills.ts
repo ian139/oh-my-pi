@@ -438,10 +438,12 @@ export async function recoverPersonalizationManagedSkill(
 	expectedArtifact?: ManagedSkillArtifactIdentity | null,
 ): Promise<ManagedSkillArtifactIdentity> {
 	const name = getPersonalizationManagedSkillName(input.projectPrefix, input.candidateId, input.suffix);
-	try {
-		return await createPersonalizationManagedSkill(input);
-	} catch (error) {
-		if (!hasErrnoCode(error, "EEXIST")) throw error;
+	if (!expectedArtifact) {
+		try {
+			return await createPersonalizationManagedSkill(input);
+		} catch (error) {
+			if (!hasErrnoCode(error, "EEXIST")) throw error;
+		}
 	}
 
 	const expectedContent = Buffer.from(buildManagedSkillContent(name, input.description, input.body), "utf8");
