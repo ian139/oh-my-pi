@@ -40,8 +40,8 @@ import {
 import { AsyncJobManager } from "./async";
 import { AutoLearnController, buildAutoLearnInstructions } from "./autolearn/controller";
 import {
-	createPersonalizationManagedSkill,
 	deleteManagedSkillIfExact,
+	recoverPersonalizationManagedSkill,
 } from "./autolearn/managed-skills";
 import { createAutoresearchExtension } from "./autoresearch";
 import { PersonalizationController } from "./personalization/controller";
@@ -1961,14 +1961,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 									throw new Error(`Managed-skill candidate ${candidate.id} has no managed-skill proposal.`);
 								}
 								const project = await resolvePersonalizationProject(cwd);
-								return createPersonalizationManagedSkill({
-									projectPrefix: project.identity.slice(0, 12),
-									candidateId: candidate.id,
-									suffix: candidate.managedSkill.name,
-									description: candidate.managedSkill.description,
-									body: candidate.managedSkill.body,
-									agentDir,
-								});
+								return recoverPersonalizationManagedSkill(
+									{
+										projectPrefix: project.identity.slice(0, 12),
+										candidateId: candidate.id,
+										suffix: candidate.managedSkill.name,
+										description: candidate.managedSkill.description,
+										body: candidate.managedSkill.body,
+										agentDir,
+									},
+									candidate.managedSkillArtifact,
+								);
 							},
 							async delete(candidate) {
 								if (!candidate.managedSkillArtifact) {

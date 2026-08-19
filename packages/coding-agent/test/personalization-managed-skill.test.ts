@@ -6,6 +6,7 @@ import {
 	createPersonalizationManagedSkill,
 	deleteManagedSkillIfExact,
 	getManagedSkillsDir,
+	recoverPersonalizationManagedSkill,
 } from "@oh-my-pi/pi-coding-agent/autolearn/managed-skills";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils/dirs";
@@ -56,6 +57,21 @@ describe("personalization managed skills", () => {
 
 		await expect(createSkill()).rejects.toThrow(/already exists/);
 		expect(await Bun.file(first.path).text()).toBe(original);
+	});
+
+	it("recovers both pre-artifact and persisted-artifact approval crash windows", async () => {
+		const created = await createSkill();
+		const input = {
+			agentDir,
+			projectPrefix: "My Project!",
+			candidateId: 42,
+			suffix: "Debug Helper",
+			description: "Use for focused debugging.",
+			body: "# Debug Helper\n\nInspect evidence before changing code.",
+		};
+
+		expect(await recoverPersonalizationManagedSkill(input)).toEqual(created);
+		expect(await recoverPersonalizationManagedSkill(input, created)).toEqual(created);
 	});
 
 	it("deletes only the exact created skill", async () => {

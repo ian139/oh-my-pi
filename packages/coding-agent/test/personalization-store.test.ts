@@ -108,6 +108,39 @@ describe("PersonalizationStore", () => {
 		store.close();
 	});
 
+	test("accepts applying-project outcomes only for global scope and rescoring feedback updates persisted utility", () => {
+		const store = PersonalizationStore.open(dbPath);
+		const home = store.ensureProject("home", "/home");
+		const applying = store.ensureProject("applying", "/applying");
+		const evidence = store.recordTrajectory(trajectory(home.id, "evidence"));
+		const applied = store.recordTrajectory(trajectory(applying.id, "applied"));
+		const projectCandidate = store.createCandidate(home.id, proposal([evidence.id]), { type: "user", ref: "project" });
+		expect(() =>
+			store.recordOutcome({
+				candidateId: projectCandidate.id,
+				trajectoryId: applied.id,
+				arm: "active",
+				utility: applied.utility,
+				hadError: false,
+			}),
+		).toThrow("does not belong to this project");
+		const globalCandidate = store.createCandidate(
+			home.id,
+			{ ...proposal([evidence.id]), scope: "global" },
+			{ type: "user", ref: "global" },
+		);
+		store.recordOutcome({
+			candidateId: globalCandidate.id,
+			trajectoryId: applied.id,
+			arm: "active",
+			utility: applied.utility,
+			hadError: false,
+		});
+		expect(store.setFeedback(applied.id, "good", null).utility).toBe(1);
+		expect(store.getOutcomeStats(globalCandidate.id).get("active")?.utility).toBe(1);
+		store.close();
+	});
+
 	test("audits transitions, stores promotion baseline, and rolls back on utility regression", () => {
 		const settings = {
 			minEvidence: 2,

@@ -18,49 +18,17 @@ import type {
 	TrajectoryRecord,
 	TurnCandidateAssignment,
 } from "./types";
-import { matchesPersonalizationTrigger, validatePersonalizationProposal } from "./validation";
+import {
+	assignPersonalizationArm,
+	matchesPersonalizationTrigger,
+	scorePersonalizationTrajectory,
+	validatePersonalizationProposal,
+} from "./validation";
 
 const PROMPT_PREVIEW_LIMIT = 500;
 const DEFAULT_AUTOLEARN_MIN_TOOL_CALLS = 5;
 
-export const PERSONALIZATION_UTILITY_WEIGHTS = Object.freeze({
-	completed: 1,
-	terminalFailure: 0.35,
-	toolErrorPenalty: 0.15,
-	retryPenalty: 0.1,
-	deniedApprovalPenalty: 0.1,
-});
-
-export interface PersonalizationTrajectorySignals {
-	completed: boolean;
-	errorCount: number;
-	retryCount: number;
-	deniedCount: number;
-}
-
-export function clampUtility(value: number): number {
-	if (Number.isNaN(value)) return 0;
-	if (value === Number.POSITIVE_INFINITY) return 1;
-	if (value === Number.NEGATIVE_INFINITY) return 0;
-	return Math.min(1, Math.max(0, value));
-}
-
-export function scorePersonalizationTrajectory(signals: PersonalizationTrajectorySignals): number {
-	const base = signals.completed
-		? PERSONALIZATION_UTILITY_WEIGHTS.completed
-		: PERSONALIZATION_UTILITY_WEIGHTS.terminalFailure;
-	return clampUtility(
-		base -
-			Math.max(0, signals.errorCount) * PERSONALIZATION_UTILITY_WEIGHTS.toolErrorPenalty -
-			Math.max(0, signals.retryCount) * PERSONALIZATION_UTILITY_WEIGHTS.retryPenalty -
-			Math.max(0, signals.deniedCount) * PERSONALIZATION_UTILITY_WEIGHTS.deniedApprovalPenalty,
-	);
-}
-
-export function assignPersonalizationArm(candidateId: number, stableTurnIdentity: string): Extract<PersonalizationArm, "control" | "treatment"> {
-	const digest = createHash("sha256").update(`${candidateId}\0${stableTurnIdentity}`).digest();
-	return (digest[0] & 1) === 0 ? "control" : "treatment";
-}
+export { assignPersonalizationArm } from "./validation";
 
 export interface PersonalizationStoreAdapter {
 	readonly persistent: boolean;
@@ -279,10 +247,10 @@ export class PersonalizationController {
 			return;
 		}
 		if (event.type !== "agent_end") return;
+		if (event.isTerminal === false) return;
 		const turn = this.#activeTurn;
 		this.#activeTurn = null;
 		this.#justRecordedTrajectory = null;
-		if (event.isTerminal === false) return;
 		if (turn.startedInPlanMode || turn.startedInGoalMode || this.#isPlanMode() || this.#isGoalMode()) return;
 		const stopReason = lastAssistantStopReason(event.messages);
 		if (stopReason === "aborted" || stopReason === "toolUse" || stopReason === null) return;
@@ -301,9 +269,10 @@ export class PersonalizationController {
 		const completed = stopReason !== "error";
 		const utility = scorePersonalizationTrajectory({
 			completed,
-			errorCount: turn.errorCount,
-			retryCount: turn.retryCount,
-			deniedCount: turn.deniedCount,
+			toolErrorCount: turn.errorCount,
+			automaticRetryCount: turn.retryCount,
+			deniedApprovalCount: turn.deniedCount,
+			explicitFeedback: null,
 		});
 		const trajectory = store.recordTrajectory({
 			projectId: project.id,
@@ -321,15 +290,23 @@ export class PersonalizationController {
 		});
 		for (const assignment of turn.assignments) {
 			if (!assignment.applied && assignment.arm !== "control") continue;
-			store.recordOutcome({
-				candidateId: assignment.candidate.id,
-				trajectoryId: trajectory.id,
-				arm: assignment.arm,
-				utility,
-				hadError: turn.errorCount > 0,
-			});
-			if (assignment.candidate.risk === "low") {
-				store.evaluateCandidate(assignment.candidate.id, this.#evaluationSettings());
+			try {
+				store.recordOutcome({
+					candidateId: assignment.candidate.id,
+					trajectoryId: trajectory.id,
+					arm: assignment.arm,
+					utility,
+					hadError: turn.errorCount > 0,
+				});
+				if (assignment.candidate.risk === "low") {
+					store.evaluateCandidate(assignment.candidate.id, this.#evaluationSettings());
+				}
+			} catch (error) {
+				logger.warn("Failed to record personalization candidate outcome", {
+					candidateId: assignment.candidate.id,
+					trajectoryId: trajectory.id,
+					error: error instanceof Error ? error.message : String(error),
+				});
 			}
 		}
 		const minToolCalls = this.#settings.get("autolearn.minToolCalls") ?? DEFAULT_AUTOLEARN_MIN_TOOL_CALLS;
@@ -393,6 +370,7 @@ export class PersonalizationController {
 			throw new Error(`Candidate ${id} cannot be approved from ${candidate.status}; review an active pending or canary candidate.`);
 		}
 		let artifact: PersonalizationManagedArtifact | null = null;
+		let artifactPersisted = false;
 		try {
 			if (candidate.kind === "managed_skill") {
 				if (!this.#managedSkills) throw new Error("Managed-skill personalization is unavailable in this session.");
@@ -401,10 +379,11 @@ export class PersonalizationController {
 					throw new Error("Managed-skill artifact persistence is unavailable in this session.");
 				}
 				store.setManagedSkillArtifact(candidate.id, artifact);
+				artifactPersisted = true;
 			}
 			return store.transition(candidate.id, "active", { actor: "user", reason: "approved by user" });
 		} catch (error) {
-			if (artifact && this.#managedSkills?.deleteCreated) {
+			if (artifact && !artifactPersisted && this.#managedSkills?.deleteCreated) {
 				try {
 					await this.#managedSkills.deleteCreated(artifact);
 				} catch (compensationError) {

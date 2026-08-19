@@ -27,6 +27,7 @@ import {
 	decidePersonalizationEvaluation,
 	isLowRiskProposal,
 	PERSONALIZATION_LIMITS,
+	scorePersonalizationTrajectory,
 	validatePersonalizationProposal,
 } from "./validation";
 
@@ -459,8 +460,18 @@ export class PersonalizationStore {
 
 	setFeedback(trajectoryId: number, feedback: "good" | "bad", note: string | null): TrajectoryRecord {
 		const safeNote = note === null ? null : boundedString(note, "feedback note", MAX_FEEDBACK_NOTE_LENGTH);
-		const utility = feedback === "good" ? 1 : 0;
 		const row = this.#db.transaction(() => {
+			const current = this.#db
+				.query<TrajectoryRow, [number]>("SELECT * FROM personalization_trajectories WHERE id = ?")
+				.get(trajectoryId);
+			if (!current) throw new Error(`Trajectory ${trajectoryId} was not found.`);
+			const utility = scorePersonalizationTrajectory({
+				completed: true,
+				toolErrorCount: current.error_count,
+				automaticRetryCount: current.retry_count,
+				deniedApprovalCount: current.denied_count,
+				explicitFeedback: feedback,
+			});
 			const updated = this.#db
 				.query(`UPDATE personalization_trajectories
 					SET feedback = ?, feedback_note = ?, utility = ? WHERE id = ? RETURNING *`)
@@ -508,6 +519,13 @@ export class PersonalizationStore {
 			)
 			.get(trajectoryId, projectId);
 		if (!exists) throw new Error(`${label} ${trajectoryId} does not belong to this project.`);
+	}
+
+	#assertTrajectoryExists(trajectoryId: number, label: string): void {
+		const exists = this.#db
+			.query<{ id: number }, [number]>("SELECT id FROM personalization_trajectories WHERE id = ?")
+			.get(trajectoryId);
+		if (!exists) throw new Error(`${label} ${trajectoryId} was not found.`);
 	}
 
 	#insertSource(candidateId: number, projectId: number, source: CandidateSourceInput): boolean {
@@ -622,7 +640,11 @@ export class PersonalizationStore {
 		this.#db.transaction(() => {
 			const candidate = this.getCandidate(input.candidateId);
 			if (!candidate) throw new Error(`Candidate ${input.candidateId} was not found.`);
-			this.#assertTrajectoryProject(input.trajectoryId, candidate.projectId, "Outcome trajectory");
+			if (candidate.scope === "global") {
+				this.#assertTrajectoryExists(input.trajectoryId, "Outcome trajectory");
+			} else {
+				this.#assertTrajectoryProject(input.trajectoryId, candidate.projectId, "Outcome trajectory");
+			}
 			this.#db
 				.query(`INSERT INTO personalization_outcomes(candidate_id, trajectory_id, arm, utility, had_error)
 					VALUES (?, ?, ?, ?, ?)

@@ -1,9 +1,6 @@
 export { PERSONALIZATION_SCHEMA_VERSION, PersonalizationStore, resolvePersonalizationProject } from "./store";
 export type * from "./types";
-export {
-	clampUtility,
-	PersonalizationController,
-} from "./controller";
+export { PersonalizationController } from "./controller";
 export type {
 	PersonalizationControllerOptions,
 	PersonalizationManagedArtifact,
@@ -11,7 +8,6 @@ export type {
 	PersonalizationProposalResult,
 	PersonalizationStatusSnapshot,
 	PersonalizationStoreAdapter,
-	PersonalizationTrajectorySignals,
 } from "./controller";
 export { createPersonalizationExtension } from "./extension";
 export type { PersonalizationExtensionOptions } from "./extension";

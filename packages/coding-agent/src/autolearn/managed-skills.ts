@@ -134,6 +134,12 @@ function getSkillMutationKey(managedRoot: string, name: string): string {
 	return `${path.resolve(managedRoot)}\0${name}`;
 }
 
+function hasErrnoCode(error: unknown, code: string): boolean {
+	if (!error || typeof error !== "object") return false;
+	if ("code" in error && error.code === code) return true;
+	return "cause" in error && hasErrnoCode(error.cause, code);
+}
+
 /**
  * Reject when the managed-skills root itself is a symlink. lstat on a child
  * follows intermediate components, so a symlinked root would let an otherwise
@@ -177,29 +183,29 @@ async function openManagedSkillFileForUpdate(name: string, file: string) {
 	}
 }
 
-/** Create or update a managed `SKILL.md`. Returns the resolved file path. */
-export async function writeManagedSkill(input: WriteManagedSkillInput): Promise<{ path: string }> {
-	const name = sanitizeSkillName(input.name);
-	const description = sanitizeManagedDescription(input.description);
-	const body = input.body.trim();
-	// Reject empty content: an all-whitespace/control description sanitizes to ""
-	// and the `requireDescription` discovery scan then silently drops the skill,
-	// so the tool would report success for a skill that never appears.
-	if (!description) {
+function buildManagedSkillContent(name: string, description: string, body: string): string {
+	const safeDescription = sanitizeManagedDescription(description);
+	const trimmedBody = body.trim();
+	if (!safeDescription) {
 		throw new Error(`Managed skill "${name}" needs a non-empty description.`);
 	}
-	if (!body) {
+	if (!trimmedBody) {
 		throw new Error(`Managed skill "${name}" needs a non-empty body.`);
 	}
-	const content = `${toSkillFrontmatter(name, description)}\n${body}\n`;
-	// Cap the UTF-8 byte size of the FINAL file (body + description + frontmatter),
-	// not the UTF-16 code-unit length of the body alone.
+	const content = `${toSkillFrontmatter(name, safeDescription)}\n${trimmedBody}\n`;
 	const bytes = Buffer.byteLength(content, "utf8");
 	if (bytes > MAX_MANAGED_SKILL_BYTES) {
 		throw new Error(
 			`Managed skill is ${bytes} bytes; the limit is ${MAX_MANAGED_SKILL_BYTES}. Trim the body or description.`,
 		);
 	}
+	return content;
+}
+
+/** Create or update a managed `SKILL.md`. Returns the resolved file path. */
+export async function writeManagedSkill(input: WriteManagedSkillInput): Promise<{ path: string }> {
+	const name = sanitizeSkillName(input.name);
+	const content = buildManagedSkillContent(name, input.description, input.body);
 	const managedRoot = getManagedSkillsDir(input.agentDir);
 	return serializeSkillMutation(getSkillMutationKey(managedRoot, name), async () => {
 		await assertManagedRootSafe(input.agentDir);
@@ -224,8 +230,10 @@ export async function writeManagedSkill(input: WriteManagedSkillInput): Promise<
 			try {
 				await fs.writeFile(file, content, { flag: "wx" });
 			} catch (err) {
-				if ((err as { code?: string }).code === "EEXIST") {
-					throw new Error(`Managed skill "${name}" already exists. Use action "update" to change it.`);
+				if (hasErrnoCode(err, "EEXIST")) {
+					throw new Error(`Managed skill "${name}" already exists. Use action "update" to change it.`, {
+						cause: err,
+					});
 				}
 				throw err;
 			}
@@ -418,6 +426,79 @@ export async function createPersonalizationManagedSkill(
 		dev: serializableStatIdentity(stat.dev),
 		ino: serializableStatIdentity(stat.ino),
 	};
+}
+
+/**
+ * Retry a candidate-specific create after a crash. Existing content is adopted
+ * only at the deterministic reserved path and only after the same exact-file
+ * checks used by rollback, plus a byte-for-byte comparison with regenerated content.
+ */
+export async function recoverPersonalizationManagedSkill(
+	input: CreatePersonalizationManagedSkillInput,
+	expectedArtifact?: ManagedSkillArtifactIdentity | null,
+): Promise<ManagedSkillArtifactIdentity> {
+	const name = getPersonalizationManagedSkillName(input.projectPrefix, input.candidateId, input.suffix);
+	try {
+		return await createPersonalizationManagedSkill(input);
+	} catch (error) {
+		if (!hasErrnoCode(error, "EEXIST")) throw error;
+	}
+
+	const expectedContent = Buffer.from(buildManagedSkillContent(name, input.description, input.body), "utf8");
+	const managedRoot = getManagedSkillsDir(input.agentDir);
+	await assertManagedRootSafe(input.agentDir);
+	const canonicalRoot = await fs.realpath(managedRoot);
+	const dir = path.join(managedRoot, name);
+	const dirStat = await fs.lstat(dir);
+	if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+		throw new Error(`Managed skill "${name}" retry path is not a regular directory; refusing recovery.`);
+	}
+	const canonicalDir = await fs.realpath(dir);
+	if (canonicalDir !== path.join(canonicalRoot, name)) {
+		throw new Error(`Managed skill "${name}" retry directory escaped the canonical managed root.`);
+	}
+	const entries = await fs.readdir(dir);
+	if (entries.length !== 1 || entries[0] !== "SKILL.md") {
+		throw new Error(`Managed skill "${name}" retry directory contains unexpected entries; refusing recovery.`);
+	}
+	const file = path.join(dir, "SKILL.md");
+	const canonicalPath = await fs.realpath(file);
+	const expectedPath = path.join(canonicalRoot, name, "SKILL.md");
+	if (canonicalPath !== expectedPath) {
+		throw new Error(`Managed skill "${name}" retry path escaped the canonical managed root.`);
+	}
+	const snapshot = await readExactManagedSkill(name, file);
+	const actualContent = Buffer.from(snapshot.bytes);
+	if (!actualContent.equals(expectedContent)) {
+		throw new Error(`Managed skill "${name}" existing content does not match the generated candidate; refusing recovery.`);
+	}
+	const artifact: ManagedSkillArtifactIdentity = {
+		name,
+		path: canonicalPath,
+		contentSha256: Bun.SHA256.hash(snapshot.bytes, "hex"),
+		size: snapshot.bytes.byteLength,
+		dev: serializableStatIdentity(snapshot.stat.dev),
+		ino: serializableStatIdentity(snapshot.stat.ino),
+	};
+	if (expectedArtifact) {
+		assertExpectedArtifactIdentity(expectedArtifact);
+		if (
+			expectedArtifact.name !== artifact.name ||
+			expectedArtifact.path !== artifact.path ||
+			expectedArtifact.contentSha256 !== artifact.contentSha256 ||
+			expectedArtifact.size !== artifact.size ||
+			(expectedArtifact.dev !== null && expectedArtifact.dev !== artifact.dev) ||
+			(expectedArtifact.ino !== null && expectedArtifact.ino !== artifact.ino)
+		) {
+			throw new Error(`Managed skill "${name}" retry identity does not match the persisted artifact; refusing recovery.`);
+		}
+	}
+	const finalStat = await fs.lstat(file);
+	assertManagedSkillFileSafeForExactDelete(name, finalStat);
+	if (!sameFileIdentity(snapshot.stat, finalStat)) {
+		throw new Error(`Managed skill "${name}" changed identity during recovery; refusing adoption.`);
+	}
+	return artifact;
 }
 
 function assertExpectedArtifactIdentity(expected: ManagedSkillArtifactIdentity): void {
