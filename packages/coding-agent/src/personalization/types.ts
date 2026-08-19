@@ -7,6 +7,8 @@ export type PersonalizationScope = "project" | "global";
 export type PersonalizationRisk = "low" | "high";
 export type PersonalizationStatus = "pending" | "canary" | "active" | "rejected" | "rolled_back";
 export type PersonalizationArm = "control" | "treatment" | "active";
+export type PersonalizationActor = "system" | "user" | "model";
+export type PersonalizationFeedback = "good" | "bad";
 
 export interface PersonalizationTrigger {
 	terms: string[];
@@ -17,6 +19,15 @@ export interface ManagedSkillProposal {
 	name: string;
 	description: string;
 	body: string;
+}
+
+export interface ManagedSkillArtifactIdentity {
+	name: string;
+	path: string;
+	contentSha256: string;
+	size: number;
+	dev: number | null;
+	ino: number | null;
 }
 
 export interface RouteProposal {
@@ -35,10 +46,13 @@ export interface PersonalizationProposal {
 	evidenceTrajectoryIds: number[];
 }
 
-export interface ProjectRecord {
-	id: number;
+export interface ResolvedPersonalizationProject {
 	identity: string;
 	root: string;
+}
+
+export interface ProjectRecord extends ResolvedPersonalizationProject {
+	id: number;
 }
 
 export interface TrajectoryInput {
@@ -58,7 +72,7 @@ export interface TrajectoryInput {
 
 export interface TrajectoryRecord extends TrajectoryInput {
 	id: number;
-	feedback: "good" | "bad" | null;
+	feedback: PersonalizationFeedback | null;
 	feedbackNote: string | null;
 	createdAt: number;
 }
@@ -75,8 +89,10 @@ export interface CandidateRecord {
 	content: string | null;
 	managedSkill: ManagedSkillProposal | null;
 	route: RouteProposal | null;
-	artifactName: string | null;
-	artifactContent: string | null;
+	managedSkillArtifact: ManagedSkillArtifactIdentity | null;
+	autoPromoted: boolean;
+	promotionBaselineUtility: number | null;
+	promotionBaselineErrorRate: number | null;
 	createdAt: number;
 	updatedAt: number;
 }
@@ -102,11 +118,52 @@ export interface OutcomeInput {
 	hadError: boolean;
 }
 
+export interface OutcomeRecord extends OutcomeInput {
+	id: number;
+	createdAt: number;
+}
+
+export interface ArmStatistics {
+	arm: PersonalizationArm;
+	samples: number;
+	utility: number;
+	errorRate: number;
+}
+
 export interface EvaluationDecision {
 	candidateId: number;
 	from: PersonalizationStatus;
 	to: PersonalizationStatus;
 	reason: string;
+}
+
+export interface CandidateTransitionOptions {
+	actor: PersonalizationActor;
+	reason: string;
+	promotionBaselineUtility?: number;
+	promotionBaselineErrorRate?: number;
+	autoPromoted?: boolean;
+}
+
+export interface AuditRecord {
+	id: number;
+	projectId: number | null;
+	candidateId: number | null;
+	event: string;
+	actor: PersonalizationActor;
+	reason: string;
+	details: Record<string, unknown> | null;
+	fromStatus: PersonalizationStatus | null;
+	toStatus: PersonalizationStatus | null;
+	createdAt: number;
+}
+
+export interface TrajectoryScoreInput {
+	completed: boolean;
+	toolErrorCount: number;
+	automaticRetryCount: number;
+	deniedApprovalCount: number;
+	explicitFeedback?: PersonalizationFeedback | null;
 }
 
 export interface TurnCandidateAssignment {
