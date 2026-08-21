@@ -142,7 +142,7 @@ export class SyncEngine {
     public config: SyncConfig,
     public statePath: string,
     public runner: (cmd: string, args: string[], options?: { cwd?: string; env?: Record<string, string> }) => { status: number; stdout: string; stderr: string } = (cmd, args, opts) => {
-      const res = spawnSync(cmd, args, { cwd: opts?.cwd, env: opts?.env ? { ...process.env, ...opts.env } : process.env, encoding: "utf8" });
+      const res = spawnSync(cmd, args, { cwd: opts?.cwd, env: opts?.env ? { ...process.env, ...opts.env } : process.env, encoding: "utf8", maxBuffer: 50 * 1024 * 1024 });
       return { status: res.status ?? 1, stdout: res.stdout || "", stderr: res.stderr || "" };
     }
   ) {}
